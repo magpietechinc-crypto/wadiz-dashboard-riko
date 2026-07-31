@@ -797,33 +797,43 @@ function fillMainTarget(rows, detected, totalDays) {
 
 // 내부 광고 리스트 — "오픈예정_내부광고 데이터" 전용 탭(gid 1132129991)의 일별 데이터
 // 열: 0집행일자 1광고종류 2광고비 3노출수 4클릭수 5CTR 6CPM 7CPC 8CPL 9광고전환수 10광고전환율
-// 표시 기준: 광고 종류가 적혀 있거나, 광고비/노출/클릭/전환 중 하나라도 값이 있는 날만.
-//           (시트는 기간 전체 날짜 행이 미리 깔려 있어서, 안 그러면 빈 행이 25개 나옴)
+// 구조 특징:
+//  - 하루에 광고가 여러 개면 첫 행에만 A열(날짜)이 있고 이후 행은 A열이 비어 있음 → 날짜 상속 필요
+//  - 시트 하단에 별도 "광고 종류 / 집행일(평일·휴일)" 단가 참고표가 붙어 있음 → 만나면 중단
+// 표시 기준: 광고 종류가 있거나 광고비/노출/클릭/전환 중 하나라도 값이 있는 행.
 function extractPreInternalAds(rows) {
   const ads = [];
   if (!rows) return ads;
 
+  let lastDate = null;
   for (let r = 0; r < rows.length; r++) {
     const row = rows[r];
-    if (!row || !row[0]) continue;
+    if (!row) continue;
+
+    // 하단 단가 참고표 시작 지점이면 중단 (B열 라벨이 '광고 종류').
+    // 단, 상단 표 헤더에도 같은 라벨이 있으므로 데이터가 시작된 뒤(날짜 확보 후)에만 중단.
+    if (lastDate && String(row[1] || '').trim() === '광고 종류') break;
+
+    // A열에 날짜가 있으면 갱신, 없으면 직전 날짜 상속 (같은 날 2번째 이후 광고)
     const dateISO = dateStrParse(row[0]);
-    if (!dateISO) continue;
+    if (dateISO) lastDate = dateISO;
+
+    // 광고 종류 라벨 (숫자/금액만 들어있으면 라벨로 안 봄)
+    let type = row[1] ? String(row[1]).trim() : '';
+    if (type && /^[\d₩,.\s%]+$/.test(type)) type = '';
 
     const spend = parseNum(row[2]);
     const impressions = parseNum(row[3]);
     const clicks = parseNum(row[4]);
     const conv = parseNum(row[9]);
 
-    // 광고 종류 라벨 (숫자/금액만 들어있으면 라벨로 안 봄)
-    let type = row[1] ? String(row[1]).trim() : '';
-    if (type && /^[\d₩,.\s%]+$/.test(type)) type = '';
-
-    // 아무 데이터도 없는 날은 스킵
+    // 아무 데이터도 없는 날(빈 날짜 행 등)은 스킵
     const hasData = spend > 0 || impressions > 0 || clicks > 0 || conv > 0 || !!type;
     if (!hasData) continue;
+    if (!lastDate) continue;   // 날짜를 못 잡은 행은 제외
 
     ads.push({
-      date: dateISO.replace(/-/g, '.'),
+      date: lastDate.replace(/-/g, '.'),
       type: type || CONFIG.preInternalAd.type || '내부광고',
       spend: spend,
       impressions: impressions,
@@ -1052,6 +1062,7 @@ function parsePreCreatives(rows) {
         shortName: blk.label.replace(/^캠페인\d+[_\s]*/, '') || blk.label,
         image: embedded[blk.label] || images[i] || '',
         ctr: agg.impressions ? (agg.clicks / agg.impressions * 100) : null,
+        cpc: agg.clicks ? (agg.spend / agg.clicks) : null,
         cpl: agg.conversions ? (agg.spend / agg.conversions) : null,
         convRate: agg.clicks ? (agg.conversions / agg.clicks * 100) : null,
         raw: agg
@@ -1603,16 +1614,30 @@ window.PLACEHOLDER_HTML = '<div style="display:flex; flex-direction:column; alig
 function renderCreatives() {
   const all = data.preCreatives || [];
 
-  function creativeCard(c) {
+  function creativeCard(c, campSpend) {
+    const r = c.raw || {};
+    const spend = r.spend || 0;
+    const sharePct = campSpend > 0 ? (spend / campSpend * 100) : 0;
+    const spendValue = `${fmt.won(spend)} <span style="color:var(--accent-primary); font-weight:600; font-size:12px;">(${sharePct.toFixed(1)}%)</span>`;
     const metrics = [
-      { label: 'CTR', value: c.ctr != null ? c.ctr.toFixed(2) + '%' : '-' },
-      { label: 'CPL', value: c.cpl != null ? fmt.won(c.cpl) : '-' },
-      { label: '광고 전환율', value: c.convRate != null ? c.convRate.toFixed(1) + '%' : '-' }
+      { label: '소진금액', value: spendValue },
+      { label: '노출', value: fmt.num(r.impressions || 0) },
+      { label: '클릭', value: fmt.num(r.clicks || 0) },
+      { label: 'CTR', value: c.ctr != null ? c.ctr.toFixed(2) + '%' : '-', hl: true },
+      { label: 'CPC', value: c.cpc != null ? fmt.won(c.cpc) : '-' },
+      { label: '광고 전환수', value: fmt.num(r.conversions || 0) },
+      { label: 'CPL', value: c.cpl != null ? fmt.won(c.cpl) : '-', hl: true },
+      { label: '광고 전환율', value: c.convRate != null ? c.convRate.toFixed(1) + '%' : '-', hl: true }
     ];
-    const rows = metrics.map(m => `
-      <div style="display:flex; justify-content:space-between; align-items:center; padding:9px 0; border-bottom:0.5px solid var(--border-tertiary);">
-        <span style="color:var(--text-secondary); font-size:13px; font-weight:400;">${m.label}</span>
-        <span style="color:var(--text-primary); font-size:15px; font-weight:400;">${m.value}</span>
+    const rows = metrics.map(m => m.hl ? `
+      <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 10px; margin:0 -10px; background:var(--accent-primary-soft); border-bottom:0.5px solid var(--border-tertiary);">
+        <span style="color:var(--accent-primary-text); font-size:12.5px; font-weight:600;">${m.label}</span>
+        <span style="color:var(--accent-primary-text); font-size:15px; font-weight:700;">${m.value}</span>
+      </div>
+    ` : `
+      <div style="display:flex; justify-content:space-between; align-items:center; padding:7px 0; border-bottom:0.5px solid var(--border-tertiary);">
+        <span style="color:var(--text-secondary); font-size:12.5px; font-weight:400;">${m.label}</span>
+        <span style="color:var(--text-primary); font-size:14px; font-weight:500;">${m.value}</span>
       </div>
     `).join('');
 
@@ -1638,13 +1663,15 @@ function renderCreatives() {
   const sections = order.map(key => {
     const list = all.filter(c => c.campaign === key);
     const label = (CONFIG.preCampaignLabels && CONFIG.preCampaignLabels[key]) || key;
+    // 캠페인 내 소진금액 합계 (소재별 비중 계산 기준)
+    const campSpend = list.reduce((s, c) => s + ((c.raw && c.raw.spend) || 0), 0);
     return `
       <div class="card-header" style="margin:0 0 12px;">
         <span class="card-title"><i class="ti ti-bell" style="font-size:14px; color:var(--accent-primary);"></i>${label}</span>
         <span class="card-meta">소재 ${list.length}개 · 전체 기간 누적</span>
       </div>
       <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:12px; margin-bottom:28px;">
-        ${list.map(creativeCard).join('')}
+        ${list.map(c => creativeCard(c, campSpend)).join('')}
       </div>
     `;
   }).join('');
