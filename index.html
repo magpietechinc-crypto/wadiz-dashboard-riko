@@ -252,6 +252,25 @@ const AUTO_REFRESH_MINUTES = 0;
 const CONFIG = {
   // 매출 현황 시트의 '전체(vat 제외)' 열과 일별 금액(VAT 포함)의 환산 비율
   vatRate: 1.1,
+
+  // ── 본펀딩 운영 목표 ────────────────────────────────────────
+  //  'minimize-loss' : 손실 최소화 (목표 금액 달성이 아니라 매출이익을 끌어올리는 것이 기준)
+  //  'hit-goal'      : 목표 펀딩 금액 달성
+  objective: 'minimize-loss',
+
+  //  광고 플랫폼(비즈센터)의 전환수·전환매출을 판단 근거로 쓸지 여부.
+  //  false면 ROAS/CPA 판정은 '실제 일별 펀딩액'만으로 하고,
+  //  플랫폼 전환 지표는 참고용으로만 표시한다.
+  trustPlatformConversions: false,
+
+  // ── 본펀딩 탭 하단 '상황 요약'의 배경 문단 ──────────────────
+  //  운영 맥락은 시트에 없으므로 여기서 직접 관리한다. 문장을 배열로 넣으면 그대로 표시된다.
+  //  (그 아래 '진행 경과'와 '전환점 전후 비교'는 시트의 주요 이슈 열에서 자동 생성)
+  mainContextNote: [
+    '오픈예정 타겟광고부터 CTR·전환율이 함께 낮았다. 관심사 타겟이 <b>「고양이」 단일</b>이라 모수가 지나치게 좁았던 것이 원인으로 보인다.',
+    '본펀딩도 소액으로 출발했으나 지표가 개선되지 않아 <b>캠페인1을 중단</b>했다.',
+    '이후 타겟을 넓히는 대신 <b>상세페이지 상단을 「아픈 고양이」 쪽으로 더 좁혀 수정</b>하고 캠페인2를 재시작했다. 일예산은 <b>약 6만 원</b> 수준으로 낮게 유지 중이다.'
+  ],
   // 오픈예정_전체 시트: 목표 알림신청자 5,000명 기준
   notifGoal: 5000,
   rewardPrice: 294900,   // 리워드 평균 금액 (오픈예정_전체 G4)
@@ -762,7 +781,29 @@ function parseMainSheet(mainRows, salesRows) {
 
   console.log('[본펀딩] KPI', { kRow: kRow, kpi: kpi });
 
-  return { detectedRows: detected, rawRows: mainRows, kpi };
+  // ── 주요 이슈 열 (일자별 운영 메모) ────────────────────────
+  //  헤더에 '주요 이슈'가 있는 열을 찾아 일별 데이터 구간에서 값을 모은다.
+  const issues = [];
+  let issueCol = -1;
+  const headLimit = detected.firstRow > 0 ? detected.firstRow : 8;
+  for (let r = 0; r < headLimit && issueCol < 0; r++) {
+    const row = mainRows[r]; if (!row) continue;
+    for (let c = 0; c < row.length; c++) {
+      if (String(row[c] || '').replace(/\s+/g, '') === '주요이슈') { issueCol = c; break; }
+    }
+  }
+  if (issueCol >= 0 && detected.firstRow >= 0) {
+    for (let r = detected.firstRow; r <= detected.lastRow; r++) {
+      const row = mainRows[r]; if (!row) continue;
+      const txt = String(row[issueCol] == null ? '' : row[issueCol]).trim();
+      if (!txt) continue;
+      const iso = dateStrParse(row[0]);
+      if (iso) issues.push({ date: iso, text: txt });
+    }
+  }
+  console.log('[본펀딩] 주요 이슈', { issueCol: issueCol, issues: issues });
+
+  return { detectedRows: detected, rawRows: mainRows, kpi, issues };
 }
 
 // 감지된 일별 행을 실제 데이터 배열로 변환
@@ -1006,6 +1047,24 @@ function readCreativeBlock(rows, totalRowIdx, baseCol, layout) {
   };
 }
 
+// 소재 블록의 일별 행 (총합계 행 다음부터 날짜가 끊길 때까지)
+function readCreativeDaily(rows, firstDataRow, dateCol, baseCol, layout) {
+  const out = [];
+  for (let r = firstDataRow; r < rows.length; r++) {
+    const row = rows[r];
+    if (!row) break;
+    const iso = dateStrParse(row[dateCol]);
+    if (!iso) break;
+    out.push({
+      date: iso,
+      spend: parseNum(row[baseCol + layout.spend]),
+      imp:   parseNum(row[baseCol + layout.imp]),
+      clk:   parseNum(row[baseCol + layout.click])
+    });
+  }
+  return out;
+}
+
 // 여러 블록을 합산
 function sumCreativeBlocks(blocks) {
   const acc = { spend:0, impressions:0, clicks:0, conversions:0, convRevenue:0 };
@@ -1081,6 +1140,41 @@ const MAIN_CAMPAIGNS = [
   { key: '캠페인5', dateCol: 108, labelCol: 132, nonTarget: 109, reTarget: 120 }
 ];
 
+// 캠페인별 광고세트(논타겟/리타겟) 누적 성과
+//  소재 라벨이 없는 블록 = '전체 일별' / '타겟광고 일별'.
+//  이 중 리타겟 열에 값이 있는 블록이 '타겟광고 일별'이며 그 총합계 행을 쓴다.
+function parseMainAdsets(rows, campaigns) {
+  if (!rows || !rows.length) return {};
+  const layout = { spend:0, imp:1, click:2, conv:7, convRev:9 };
+  const isDate = v => !!dateStrParse(v);
+  const out = {};
+
+  campaigns.forEach(cp => {
+    // 소재 라벨 없는 날짜 블록들의 총합계 행 수집
+    const totals = [];
+    for (let i = 0; i < rows.length; i++) {
+      const cur = rows[i] && rows[i][cp.dateCol];
+      const prev = rows[i-1] && rows[i-1][cp.dateCol];
+      if (!isDate(cur) || isDate(prev)) continue;
+      let label = '';
+      for (let k = 2; k <= 6 && i - k >= 0; k++) {
+        const v = rows[i-k] && rows[i-k][cp.labelCol];
+        const tx = v ? String(v).trim() : '';
+        if (tx && tx.indexOf('소재') !== -1) { label = tx; break; }
+      }
+      if (!label) totals.push(i - 1);
+    }
+    // 리타겟 열에 값이 있는 첫 블록
+    for (let n = 0; n < totals.length; n++) {
+      const r = totals[n];
+      const nt = readCreativeBlock(rows, r, cp.nonTarget, layout);
+      const rt = readCreativeBlock(rows, r, cp.reTarget,  layout);
+      if (rt && (rt.spend > 0 || rt.impressions > 0)) { out[cp.key] = { nonTarget: nt, reTarget: rt }; break; }
+    }
+  });
+  return out;
+}
+
 function parsePreCreatives(rows, campaigns, stage) {
   if (!rows || rows.length === 0) return [];
 
@@ -1096,10 +1190,11 @@ function parsePreCreatives(rows, campaigns, stage) {
     const images = (CONFIG.preCreativeImages && CONFIG.preCreativeImages[cp.key]) || [];
     const embedded = (typeof CREATIVE_IMAGES !== 'undefined' && CREATIVE_IMAGES) ? CREATIVE_IMAGES : {};
     blocks.forEach((blk, i) => {
-      const agg = sumCreativeBlocks([
-        readCreativeBlock(rows, blk.totalRow, cp.nonTarget, layout),
-        readCreativeBlock(rows, blk.totalRow, cp.reTarget,  layout)
-      ]);
+      const ntRaw = readCreativeBlock(rows, blk.totalRow, cp.nonTarget, layout);
+      const rtRaw = readCreativeBlock(rows, blk.totalRow, cp.reTarget,  layout);
+      const agg = sumCreativeBlocks([ntRaw, rtRaw]);
+      const dNt = readCreativeDaily(rows, blk.totalRow + 1, cp.dateCol, cp.nonTarget, layout);
+      const dRt = readCreativeDaily(rows, blk.totalRow + 1, cp.dateCol, cp.reTarget,  layout);
       // 이미지 키: 본펀딩은 '본펀딩_캠페인N_소재M' 우선(오픈예정과 라벨이 겹치므로),
       //  없으면 라벨 그대로 폴백.
       const mainKey = '본펀딩_' + blk.label;
@@ -1111,6 +1206,7 @@ function parsePreCreatives(rows, campaigns, stage) {
         name: blk.label,
         shortName: blk.label.replace(/^캠페인\d+[_\s]*/, '') || blk.label,
         image: img,
+        nt: ntRaw, rt: rtRaw, dailyNt: dNt, dailyRt: dRt,
         ctr: agg.impressions ? (agg.clicks / agg.impressions * 100) : null,
         cpc: agg.clicks ? (agg.spend / agg.clicks) : null,
         cpl: agg.conversions ? (agg.spend / agg.conversions) : null,
@@ -1164,11 +1260,13 @@ async function loadAll() {
     data.preInternalAds = extractPreInternalAds(preInternalRows);
     data.preCreatives = preRawRows ? parsePreCreatives(preRawRows, PRE_CAMPAIGNS, 'pre') : [];
     data.mainCreatives = mainRawRows ? parsePreCreatives(mainRawRows, MAIN_CAMPAIGNS, 'main') : [];
+    data.mainAdsets = mainRawRows ? parseMainAdsets(mainRawRows, MAIN_CAMPAIGNS) : {};
     data.expected = preData ? preData.kpi : null;
     data.notifConversion = preData ? preData.notifConversion : null;
 
     // 본펀딩 데이터
     data.mainKpi = mainData ? mainData.kpi : null;
+    data.mainIssues = mainData ? (mainData.issues || []) : [];
     data.mainTarget = mainData ? fillMainTarget(mainData.rawRows, mainData.detectedRows, data.dates.length) : emptyTarget('main');
     // 본펀딩 내부광고: 별도 시트(본펀딩_내부광고)를 오픈예정과 동일 방식으로 파싱
     data.mainInternalAds = mainInternalRows ? extractPreInternalAds(mainInternalRows) : [];
@@ -1597,6 +1695,777 @@ function renderPre() {
   `;
 }
 
+// ============================================================
+//  본펀딩 타겟광고 — 상황 요약 + 지금 취할 액션 (자동 생성)
+//  ─ 시트가 갱신되면 이 섹션도 같이 다시 계산된다.
+//  ─ 외부 API 없이 대시보드가 이미 읽은 값만으로 규칙 판정한다.
+// ============================================================
+
+// 손익분기 ROAS = 1 / 기여이익률
+//   기여이익률 = 1 - (수수료 + 제조원가 + 배송비 + LOSS + 쿠폰) / 수입(VAT 제외)
+// 광고비를 1원 더 썼을 때 본전이 되는 ROAS(VAT 제외 매출 기준).
+function breakEvenRoas() {
+  const b = (data.summary && data.summary.breakdown) || null;
+  if (!b || !b.revenueExVat) return null;
+  const variable = (b.fee || 0) + (b.cogs || 0) + (b.shipping || 0) + (b.loss || 0) + (b.coupon || 0);
+  const margin = 1 - (variable / b.revenueExVat);
+  if (!(margin > 0.02)) return null;
+  return { roas: 100 / margin, marginPct: margin * 100 };
+}
+
+function analyzeMain() {
+  const m = data.mainKpi || {};
+  const t = data.mainTarget;
+  const vat = (CONFIG.vatRate && CONFIG.vatRate > 0) ? CONFIG.vatRate : 1;
+  if (!t || !data.dates.length) return null;
+
+  const s0 = data.mainStartIdx >= 0 ? data.mainStartIdx : 0;
+  const s1 = data.mainEndIdx >= s0 ? data.mainEndIdx : data.dates.length - 1;
+
+  const active = [];
+  for (let i = s0; i <= s1; i++) if ((t.spend[i] || 0) > 0) active.push(i);
+
+  const agg = idxs => {
+    const a = { spend:0, imp:0, clk:0, conv:0, rev:0, days: idxs.length };
+    idxs.forEach(i => {
+      a.spend += t.spend[i] || 0;
+      a.imp   += t.impressions[i] || 0;
+      a.clk   += t.clicks[i] || 0;
+      a.conv  += t.conversions[i] || 0;
+      a.rev   += t.convRevenue[i] || 0;
+    });
+    a.ctr  = a.imp ? a.clk / a.imp * 100 : null;
+    a.cpc  = a.clk ? a.spend / a.clk : null;
+    a.cpa  = a.conv ? a.spend / a.conv : null;
+    a.cvr  = a.clk ? a.conv / a.clk * 100 : null;
+    a.roas = a.spend ? (a.rev / vat) / a.spend * 100 : null;
+    a.daily = a.days ? a.spend / a.days : 0;
+    return a;
+  };
+
+  const all = agg(active);
+  const N = Math.min(3, Math.floor(active.length / 2));
+  const recent = N > 0 ? agg(active.slice(-N)) : null;
+  const prev   = N > 0 ? agg(active.slice(-2 * N, -N)) : null;
+
+  // 기간 진행률
+  const todayISO = (() => { const d = new Date(); d.setHours(0,0,0,0);
+    return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; })();
+  let todayIdx = data.dates.indexOf(todayISO);
+  if (todayIdx < 0) todayIdx = (todayISO > data.dates[s1]) ? s1 : s0;
+  todayIdx = Math.max(s0, Math.min(todayIdx, s1));
+  const totalDays   = s1 - s0 + 1;
+  const elapsedDays = todayIdx - s0 + 1;
+  const remainDays  = s1 - todayIdx;
+  const elapsedPct  = totalDays ? elapsedDays / totalDays * 100 : 0;
+
+  const be   = breakEvenRoas();
+  const goal = (m.achievement > 0) ? (m.cumulative / (m.achievement / 100)) : null;
+
+  // 광고 예산 역산 (사용액 ÷ 사용률)
+  let budget = null, budgetLeft = null, dailyRoom = null;
+  if (m.adUsage > 0 && m.adSpend > 0) {
+    budget = m.adSpend / (m.adUsage / 100);
+    budgetLeft = Math.max(0, budget - m.adSpend);
+    dailyRoom = remainDays > 0 ? budgetLeft / remainDays : null;
+  }
+
+  // 전환점 — 시트 '주요 이슈'에서 캠페인 시작/재개 메모를 찾는다
+  let pivotCompare = null;
+  const issues = data.mainIssues || [];
+  let pivot = null;
+  for (let k = issues.length - 1; k >= 0; k--) {
+    if (/캠페인\s*\d*\s*(시작|재개|재시작|런칭)/.test(issues[k].text)) { pivot = issues[k]; break; }
+  }
+  if (pivot) {
+    const pIdx = data.dates.indexOf(pivot.date);
+    if (pIdx > 0) {
+      const before = agg(active.filter(i => i < pIdx));
+      const after  = agg(active.filter(i => i >= pIdx));
+      if (before.spend > 0 && after.spend > 0) {
+        pivotCompare = { text: pivot.text, date: pivot.date, idx: pIdx, before, after };
+      }
+    }
+  }
+
+  // ── 손실 최소화 관점의 계산 ────────────────────────────────
+  //  광고비 1원을 더 쓰면 매출이익이 얼마나 움직이나?
+  //    추가 기여이익 = 광고비 × (ROAS ÷ 100) × 기여이익률
+  //    순효과       = 그 값 − 광고비 = 광고비 × (ROAS/100 × 마진 − 1)
+  //  즉 ROAS가 손익분기(1/마진)를 넘으면 광고를 쓸수록 손실이 줄어든다.
+  const lossMode = (CONFIG.objective || 'minimize-loss') === 'minimize-loss';
+  const marginRate = be ? be.marginPct / 100 : null;
+  const effRoas = (recent && recent.roas != null) ? recent.roas : all.roas;   // 최근 효율 기준
+  const perWon = (marginRate != null && effRoas != null) ? (effRoas / 100 * marginRate - 1) : null;
+  const curProfit = (data.summary && data.summary.currentProfit != null) ? data.summary.currentProfit : null;
+  // 지금 효율이 유지될 때 누적 매출이익이 0이 되는 데 필요한 추가 광고비
+  const beAdSpend = (curProfit != null && curProfit < 0 && perWon > 0) ? (-curProfit / perWon) : null;
+
+  // ── 어트리뷰션 교차검증 ────────────────────────────────────
+  //  광고 플랫폼이 잡는 전환수와 와디즈 실제 결제 건수는 기준이 다르다.
+  //   · 플랫폼: 클릭/조회 어트리뷰션 (광고를 거친 사람을 광고 공으로 인정)
+  //   · 와디즈: 마지막 유입 채널 기준
+  //  → 플랫폼 ROAS를 그대로 믿을 수 없으므로 세 가지로 나눠 본다.
+  const cross = { coverage: null, platRoas: all.roas, recentRoas: effRoas,
+                  overallRoas: null, incTarget: null, incAll: null, onDays: 0, offDays: 0,
+                  liftPerDay: null, offAvg: null, onAvg: null };
+
+  // (1) 커버리지 — 플랫폼 전환수 ÷ 실제 판매 수량
+  if (m.unitsSold > 0) cross.coverage = all.conv / m.unitsSold * 100;
+
+  // (2) 전체 기준 ROAS — 총 펀딩(VAT 제외) ÷ 총 광고비
+  if (m.adSpend > 0 && m.cumulative > 0) cross.overallRoas = (m.cumulative / vat) / m.adSpend * 100;
+
+  // (3) 증분 추정 — 광고 집행일과 미집행일의 일별 펀딩액 차이 (자연실험)
+  //     오픈 첫날은 알림신청 전환이 몰려 아웃라이어이므로 제외한다.
+  const fundSeq = (data.summary && data.summary.dailyFundingSeq) || [];
+  const adSeq   = (data.summary && data.summary.dailyMainAdSeq) || [];
+  if (fundSeq.length > 2) {
+    const onF = [], offF = [], onAd = [], onTgt = [];
+    for (let i = 1; i < fundSeq.length; i++) {
+      const gi = s0 + i;
+      if (gi > todayIdx) break;
+      const f = fundSeq[i];
+      if (f == null) continue;
+      const a = (adSeq[i] != null) ? adSeq[i] : 0;
+      if (a > 0) { onF.push(f); onAd.push(a); onTgt.push(t.spend[gi] || 0); }
+      else offF.push(f);
+    }
+    const mean = arr => arr.length ? arr.reduce((x, y) => x + y, 0) / arr.length : 0;
+    if (onF.length >= 3 && offF.length >= 2) {
+      cross.onDays = onF.length; cross.offDays = offF.length;
+      cross.onAvg = mean(onF); cross.offAvg = mean(offF);
+      cross.liftPerDay = cross.onAvg - cross.offAvg;
+      const adAll = mean(onAd), adTgt = mean(onTgt);
+      if (adAll > 0) cross.incAll    = (cross.liftPerDay / vat) / adAll * 100;
+      if (adTgt > 0) cross.incTarget = (cross.liftPerDay / vat) / adTgt * 100;
+    }
+  }
+
+  // ── 활성 캠페인 기준 재계산 ────────────────────────────────
+  //  중단된 캠페인이 섞이면 누적치가 판단을 흐린다.
+  //  전환점('캠페인 N 시작') 이후 구간을 '현재 돌고 있는 캠페인'으로 보고 따로 계산한다.
+  const liveName = pivotCompare ? pivotCompare.text.replace(/\s*(시작|재개|재시작|런칭).*$/, '').trim() : null;
+  const liveKey  = liveName ? liveName.replace(/\s+/g, '') : null;   // 시트 메모의 '캠페인 2' → 키 '캠페인2'
+  const live = pivotCompare ? pivotCompare.after : null;
+
+  if (live) {
+    // 활성 캠페인 기간의 증분 — 그 직전 광고 공백일을 대조군으로
+    const pIdx = pivotCompare.idx;
+    const onF = [], onAdT = [], onAdA = [], offF = [];
+    for (let i = 1; i < fundSeq.length; i++) {
+      const gi = s0 + i;
+      if (gi > todayIdx) break;
+      const f = fundSeq[i]; if (f == null) continue;
+      const a = (adSeq[i] != null) ? adSeq[i] : 0;
+      if (gi >= pIdx) { if (a > 0) { onF.push(f); onAdA.push(a); onAdT.push(t.spend[gi] || 0); } }
+      else if (a === 0) offF.push(f);          // 전환점 직전 공백 구간 = 대조군
+    }
+    const mean = arr => arr.length ? arr.reduce((x, y) => x + y, 0) / arr.length : 0;
+    cross.live = { name: liveName, days: onF.length, ctrlDays: offF.length,
+                   platRoas: live.roas, onAvg: mean(onF), offAvg: mean(offF),
+                   lift: null, incTarget: null, incAll: null, incRobust: null };
+    if (onF.length >= 2 && offF.length >= 2) {
+      cross.live.lift = cross.live.onAvg - cross.live.offAvg;
+      const aT = mean(onAdT), aA = mean(onAdA);
+      if (aT > 0) cross.live.incTarget = (cross.live.lift / vat) / aT * 100;
+      if (aA > 0) cross.live.incAll    = (cross.live.lift / vat) / aA * 100;
+      // 강건성 — 캠페인 첫날(스파이크)을 빼고 다시 계산
+      if (onF.length >= 3) {
+        const l2 = mean(onF.slice(1)) - cross.live.offAvg;
+        const a2 = mean(onAdT.slice(1));
+        if (a2 > 0) cross.live.incRobust = (l2 / vat) / a2 * 100;
+      }
+    }
+  }
+
+  // 판정에 쓸 보수값 / 낙관값
+  //  trustPlatformConversions=false면 플랫폼 전환에서 나온 ROAS는 후보에서 뺀다.
+  //  남는 것은 '실제 일별 펀딩액'에서 나온 증분 추정뿐이다.
+  const trustConv = CONFIG.trustPlatformConversions !== false;
+  const cand = (cross.live
+      ? (trustConv ? [cross.live.platRoas, cross.live.incTarget, cross.live.incRobust]
+                   : [cross.live.incTarget, cross.live.incRobust])
+      : (trustConv ? [cross.incAll, cross.incTarget, cross.recentRoas, cross.overallRoas]
+                   : [cross.incAll, cross.incTarget]))
+    .filter(v => v != null && isFinite(v));
+  const roasLow  = cand.length ? Math.min.apply(null, cand) : null;
+  const roasHigh = cand.length ? Math.max.apply(null, cand) : null;
+
+  // ── 신호 ──────────────────────────────────────────────────
+  const signals = [];
+  const roasLvl = (all.roas == null || !be) ? 'info'
+    : (all.roas >= be.roas ? 'good'
+      : (recent && recent.roas >= be.roas ? 'warn' : 'bad'));
+  if (all.roas != null) signals.push({ level: roasLvl, label: '광고 효율',
+    value: `${all.roas.toFixed(0)}%`, sub: be ? `손익분기 ${be.roas.toFixed(0)}%` : 'ROAS 누적' });
+  if (recent && prev && prev.roas != null && recent.roas != null) {
+    const up = recent.roas >= prev.roas;
+    signals.push({ level: up ? 'good' : 'warn', label: '최근 추세',
+      value: up ? '개선' : '악화', sub: `최근 ${N}일 ROAS ${recent.roas.toFixed(0)}%` });
+  }
+  if (m.adUsage != null) {
+    const diff = m.adUsage - elapsedPct;
+    signals.push({ level: Math.abs(diff) < 15 ? 'good' : (diff < 0 ? 'warn' : 'bad'),
+      label: '예산 소진', value: fmt.pct(m.adUsage), sub: `기간 경과 ${elapsedPct.toFixed(0)}%` });
+  }
+
+  if (lossMode) {
+    // 손실 최소화 모드에서는 '목표 달성률' 대신 손익 지표를 본다
+    if (marginRate != null && roasLow != null) {
+      const pLow  = roasLow  / 100 * marginRate - 1;
+      const pHigh = roasHigh / 100 * marginRate - 1;
+      const same  = Math.abs(pHigh - pLow) < 0.05;
+      signals.push({ level: pLow > 0 ? 'good' : (pHigh > 0 ? 'warn' : 'bad'),
+        label: '광고비 1원당 손익',
+        value: same ? `${pLow > 0 ? '+' : ''}${pLow.toFixed(2)}원`
+                    : `${pLow > 0 ? '+' : ''}${pLow.toFixed(2)} ~ +${pHigh.toFixed(2)}원`,
+        sub: same ? `ROAS ${roasLow.toFixed(0)}% 기준` : `집계 기준별 ROAS ${roasLow.toFixed(0)}~${roasHigh.toFixed(0)}%` });
+    }
+    if (curProfit != null) {
+      signals.push({ level: curProfit >= 0 ? 'good' : 'warn', label: '누적 매출 이익',
+        value: fmt.wonShort(curProfit),
+        sub: beAdSpend ? `손익분기까지 광고비 ${fmt.wonShort(beAdSpend)}` : '매출 현황 기준' });
+    }
+    if (cross.coverage != null) {
+      signals.push({ level: cross.coverage < 30 ? 'bad' : (cross.coverage < 60 ? 'warn' : 'good'),
+        label: '광고 집계 커버리지', value: `${cross.coverage.toFixed(0)}%`,
+        sub: `플랫폼 ${fmt.num(all.conv)}건 / 실제 ${fmt.num(m.unitsSold)}건` });
+    }
+  } else if (goal && m.cumulative) {
+    const projected = (data.summary && data.summary.expectedTotalFunding) || m.cumulative;
+    const rate = projected / goal * 100;
+    signals.push({ level: rate >= 100 ? 'good' : (rate >= 70 ? 'warn' : 'bad'),
+      label: '목표 페이스', value: `${rate.toFixed(0)}%`, sub: `예상 ${fmt.wonShort(projected)}` });
+  }
+
+  // ── 액션 ──────────────────────────────────────────────────
+  // { level, title, why:[문장], pri }
+  const actions = [];
+  const won = v => fmt.wonShort(Math.round(v));
+  const activeDaysLabel = `${active.length}일`;
+
+  // 1) 예산 — 가장 중요한 결정
+  //    ROAS 추정치가 기준마다 크게 벌어지므로 '보수값'과 '낙관값'을 함께 본다.
+  if (be && roasLow != null) {
+    const under = (m.adUsage != null) && (m.adUsage - elapsedPct < -10);
+    const range = `<b>${roasLow.toFixed(0)}~${roasHigh.toFixed(0)}%</b>`;
+    const roomTxt = (under && dailyRoom)
+      ? ` 기간은 <b>${elapsedPct.toFixed(0)}%</b> 지났는데 예산은 <b>${fmt.pct(m.adUsage)}</b>만 썼고, 남은 ${remainDays}일에 <b>${won(budgetLeft)}</b>이 있습니다.`
+      : '';
+
+    const scope = cross.live ? `<b>${cross.live.name}</b> 기준(${cross.live.days}일)` : '전체 기준';
+    const basis = trustConv ? '' :
+      ` 플랫폼 전환수는 실제 결제와 어긋나 판단에서 제외했고, <b>실제 일별 펀딩액</b>만으로 계산한 값입니다.`;
+
+    if (roasLow >= be.roas) {
+      const why = [`광고를 켠 날과 껐던 날의 <b>실제 펀딩액 차이</b>로 계산한 ROAS가 ${range}로, 손익분기 <b>${be.roas.toFixed(0)}%</b>를 넉넉히 넘습니다.${basis}`];
+      if (cross.live && cross.live.lift != null) {
+        why.push(`광고 공백 ${cross.live.ctrlDays}일의 일평균 펀딩은 <b>${won(cross.live.offAvg)}</b>, ${cross.live.name} 집행 ${cross.live.days}일은 <b>${won(cross.live.onAvg)}</b>입니다. 차이 <b>${won(cross.live.lift)}</b>/일이 광고가 만든 몫입니다.`);
+      }
+      why.push(`가장 보수적인 <b>${roasLow.toFixed(0)}%</b>로 잡아도 광고비 1원당 매출이익이 <b>+${(roasLow/100*marginRate - 1).toFixed(2)}원</b>입니다.` + roomTxt);
+      actions.push({ pri: 1, level: 'good', title: '일예산을 올리세요', why });
+    } else if (roasHigh >= be.roas) {
+      const perLow  = (roasLow  / 100 * marginRate - 1);
+      const perHigh = (roasHigh / 100 * marginRate - 1);
+      const step = recent ? Math.round(recent.daily * 1.5 / 10000) * 10000 : null;
+      actions.push({ pri: 1, level: 'warn',
+        title: '한 번에 늘리지 말고 단계적으로 올리며 검증하세요',
+        why: [`${scope}으로 계산해도 ROAS가 ${range}로 손익분기 <b>${be.roas.toFixed(0)}%</b>를 사이에 두고 갈립니다. 광고비 1원당 매출이익이 <b>${perLow >= 0 ? '+' : ''}${perLow.toFixed(2)}원 ~ +${perHigh.toFixed(2)}원</b>이라 <b>지금 데이터로는 단정할 수 없습니다.</b>${basis}`,
+              step ? `일예산을 <b>${won(recent.daily)} → ${won(step)}</b> 정도로 한 단계만 올리고 3일간 <b>일별 펀딩액</b>이 실제로 따라 오르는지 보세요. 오르면 다시 한 단계, 아니면 원위치.` : `한 단계만 올리고 3일 단위로 확인한 뒤 다음을 결정하세요.`,
+              `집행 <b>${activeDaysLabel}</b>, 대조군 <b>${cross.live ? cross.live.ctrlDays + '일' : '-'}</b>로 표본이 얇습니다. 하루 결제 한두 건에 결과가 흔들립니다.` + roomTxt] });
+    } else {
+      actions.push({ pri: 1, level: 'bad', title: '집행을 줄이세요 — 지금은 쓸수록 손실입니다',
+        why: [`${scope}으로 계산해도 ROAS가 ${range}로 손익분기 <b>${be.roas.toFixed(0)}%</b>에 미달합니다.${basis}`,
+              `반응이 가장 나쁜 소재부터 정리하고, 기준선을 넘긴 뒤에 다시 늘리세요.`] });
+    }
+  }
+
+  // 1-1) 광고세트(논타겟/리타겟) 배분
+  //   전환수를 못 믿는 상황이므로 CTR·CPC(어트리뷰션과 무관한 지표)로 비교한다.
+  let adsets = null;
+  if (data.mainAdsets && liveKey) {
+    const k = Object.keys(data.mainAdsets).find(x => x.replace(/\s+/g, '') === liveKey);
+    if (k) adsets = data.mainAdsets[k];
+  }
+  if (adsets && adsets.nonTarget && adsets.reTarget) {
+    const mk = (nm, g) => ({ nm, spend: g.spend, imp: g.impressions, clk: g.clicks, conv: g.conversions,
+      ctr: g.impressions ? g.clicks / g.impressions * 100 : null,
+      cpc: g.clicks ? g.spend / g.clicks : null });
+    const A = mk('논타겟', adsets.nonTarget), B = mk('리타겟', adsets.reTarget);
+    const tot = A.spend + B.spend;
+    if (tot > 0 && A.cpc != null && B.cpc != null) {
+      const gapCtr = (A.ctr && B.ctr) ? Math.abs(A.ctr - B.ctr) / Math.max(A.ctr, B.ctr) * 100 : 0;
+      const gapCpc = Math.abs(A.cpc - B.cpc) / Math.max(A.cpc, B.cpc) * 100;
+      const line = `<b>논타겟</b> CTR ${A.ctr.toFixed(2)}% · CPC ${won(A.cpc)} · 예산 ${(A.spend/tot*100).toFixed(0)}%, ` +
+                   `<b>리타겟</b> CTR ${B.ctr.toFixed(2)}% · CPC ${won(B.cpc)} · 예산 ${(B.spend/tot*100).toFixed(0)}%입니다.`;
+      if (gapCtr < 20 && gapCpc < 20) {
+        actions.push({ pri: 3, level: 'info', title: '논타겟·리타겟은 아직 우열을 가릴 수 없습니다',
+          why: [line,
+                `클릭 단계 지표가 거의 같습니다. 전환수로는 차이가 나 보이지만 <b>표본이 ${fmt.num(A.conv + B.conv)}건뿐이고 집계 자체가 불확실</b>해서 근거로 삼기 어렵습니다. 한쪽으로 예산을 몰기 전에 데이터를 더 쌓으세요.`] });
+      } else {
+        const good = (A.cpc <= B.cpc) ? A : B, poor = (good === A) ? B : A;
+        const gs = good.spend / tot * 100, ps = poor.spend / tot * 100;
+        actions.push({ pri: ps > gs ? 1 : 3, level: ps > gs ? 'warn' : 'info',
+          title: ps > gs ? `예산을 ${poor.nm}에서 ${good.nm}으로 옮기세요` : '광고세트 배분은 현재 방향이 맞습니다',
+          why: [line,
+                ps > gs ? `클릭당 비용이 <b>${good.nm}</b>이 ${(poor.cpc/good.cpc).toFixed(1)}배 저렴한데 예산은 ${poor.nm}에 더 들어가 있습니다. 배분을 뒤집으면 같은 돈으로 유입이 늘어납니다.`
+                        : `효율이 나은 ${good.nm}에 예산이 더 배정돼 있습니다. 유지하세요.`] });
+      }
+    }
+  }
+
+  // 2) 소재 정리 / 재배분
+  //  활성 캠페인 소재만 본다. 전환수를 못 믿으므로 CTR·CPC로 판단한다.
+  const cr = (data.mainCreatives || [])
+    .filter(c => c.raw && c.raw.impressions > 0)
+    .filter(c => !liveKey || String(c.campaign).replace(/\s+/g, '') === liveKey);
+  if (cr.length >= 3) {
+    const totalSpend = cr.reduce((a, c) => a + (c.raw.spend || 0), 0);
+    const withCtr = cr.filter(c => c.ctr != null).sort((a, b) => b.ctr - a.ctr);
+    if (withCtr.length >= 3) {
+      const best = withCtr[0], worst = withCtr[withCtr.length - 1];
+      const bShare = totalSpend ? best.raw.spend / totalSpend * 100 : 0;
+      const wShare = totalSpend ? worst.raw.spend / totalSpend * 100 : 0;
+      const why = [
+        `CTR·CPC 기준 순위는 ${withCtr.map(c => `<b>${c.name}</b> ${c.ctr.toFixed(2)}%`).join(' &gt; ')} 입니다. (전환수는 집계가 불확실해 순위에서 제외)`,
+        `최고 <b>${best.name}</b>(CTR ${best.ctr.toFixed(2)}% · CPC ${best.cpc ? won(best.cpc) : '-'} · 예산 ${bShare.toFixed(0)}%)와 최저 <b>${worst.name}</b>(CTR ${worst.ctr.toFixed(2)}% · CPC ${worst.cpc ? won(worst.cpc) : '-'} · 예산 ${wShare.toFixed(0)}%)의 차이는 <b>${(best.ctr / worst.ctr).toFixed(1)}배</b>입니다.`
+      ];
+      if (best.ctr / worst.ctr >= 1.5) {
+        why.push(`<b>${worst.name}</b>을 끄고 그 예산을 <b>${best.name}</b>으로 옮기세요. 클릭 단가 기준이라 어트리뷰션과 무관하게 확실한 개선입니다.`);
+        actions.push({ pri: 2, level: 'warn', title: '반응이 가장 나쁜 소재를 끄세요', why });
+      } else {
+        actions.push({ pri: 3, level: 'info', title: '소재 간 차이는 아직 크지 않습니다', why });
+      }
+    }
+  }
+
+  // 3) 추세 악화
+  if (recent && prev && prev.spend > 0 && recent.roas != null && prev.roas != null && recent.roas < prev.roas) {
+    actions.push({ pri: 2, level: 'warn', title: '소재 피로도를 점검하세요',
+      why: [`최근 ${N}일 ROAS <b>${recent.roas.toFixed(0)}%</b>가 직전 ${N}일 <b>${prev.roas.toFixed(0)}%</b>보다 낮습니다.`,
+            `같은 소재가 오래 돌면 CTR부터 떨어집니다. 신규 소재 교체나 타겟 확장을 검토하세요.`] });
+  }
+
+  // 4) 집행 공백
+  const gapDays = [];
+  for (let i = s0; i <= todayIdx; i++) if (!(t.spend[i] > 0)) gapDays.push(i);
+  if (gapDays.length >= 2) {
+    actions.push({ pri: 3, level: 'info', title: '집행 공백일이 생기지 않게 하세요',
+      why: [`본펀딩 시작 이후 <b>${gapDays.length}일</b>은 타겟광고가 나가지 않았습니다. (${fmt.dateMD(gapDays[0])} 등)`,
+            `캠페인 교체 사이에 다음 캠페인을 미리 예약해 두면 공백이 사라집니다.`] });
+  }
+
+  // 4-1) 집계 신뢰도 — 플랫폼 전환과 실제 결제가 크게 어긋날 때
+  if (cross.coverage != null && cross.coverage < 60) {
+    const why = [`광고 플랫폼이 잡은 전환은 <b>${fmt.num(all.conv)}건</b>인데 실제 판매는 <b>${fmt.num(m.unitsSold)}건</b>입니다. 커버리지가 <b>${cross.coverage.toFixed(0)}%</b>에 그칩니다.`,
+                 `플랫폼은 광고를 거친 사람을 광고 성과로 잡고, 와디즈는 마지막 유입 채널로 잡습니다. 기준이 달라 생기는 차이라 <b>어느 한쪽이 틀린 것은 아니지만</b>, 플랫폼 ROAS만 보고 예산을 결정하면 위험합니다.`];
+    if (cross.liftPerDay != null) {
+      why.push(`광고 집행일 ${cross.onDays}일의 일평균 펀딩은 <b>${won(cross.onAvg)}</b>, 미집행일 ${cross.offDays}일은 <b>${won(cross.offAvg)}</b>입니다. 차이 <b>${won(cross.liftPerDay)}</b>/일을 광고 기여로 보면 증분 ROAS는 <b>${cross.incAll != null ? cross.incAll.toFixed(0) + '%' : '-'}</b>(전체 광고비 기준) ~ <b>${cross.incTarget != null ? cross.incTarget.toFixed(0) + '%' : '-'}</b>(타겟광고비 기준)입니다.`);
+    }
+    why.push(`와디즈 유입 채널 리포트의 <b>UTM별 결제 금액</b>과 이 시트의 광고 전환매출을 날짜별로 맞춰보면 어느 쪽이 실제에 가까운지 판별할 수 있습니다.`);
+    actions.push({ pri: 2, level: 'warn', title: '광고 집계 기준을 실제 결제와 맞춰보세요', why });
+  }
+
+  // 5) 손실 최소화 모드 — 예산 소진 자체를 목표로 삼지 않도록
+  if (lossMode && be) {
+    actions.push({ pri: 2, level: 'info', title: '손익분기 ROAS를 집행 기준선으로 두세요',
+      why: [`기준선은 <b>ROAS ${be.roas.toFixed(0)}%</b>입니다. (기여이익률 ${be.marginPct.toFixed(1)}%)`,
+            `이 아래로 떨어지면 그날부터는 집행할수록 손실이 커집니다. <b>예산을 다 쓰는 것 자체가 목표가 아니므로</b>, 효율이 기준선 밑으로 내려가면 즉시 감액하세요.`,
+            `반대로 기준선 위에서는 남은 예산 <b>${budgetLeft ? won(budgetLeft) : '-'}</b>를 최대한 집행하는 쪽이 손실을 줄입니다.`] });
+  }
+
+  // 6) 목표 기준 (목표 달성 모드에서만)
+  if (!lossMode && goal && m.cumulative && remainDays > 0) {
+    const dailyAvg = elapsedDays ? m.cumulative / elapsedDays : 0;
+    const projected = (data.summary && data.summary.expectedTotalFunding) || (m.cumulative + dailyAvg * remainDays);
+    const rate = projected / goal * 100;
+    if (rate < 100) {
+      const need = Math.max(0, (goal - m.cumulative) / remainDays);
+      const mult = need / Math.max(1, dailyAvg);
+      actions.push({ pri: mult > 5 ? 3 : 2, level: mult > 5 ? 'info' : 'warn',
+        title: mult > 5 ? '목표 대신 ROAS 기준으로 운영하세요' : '펀딩 페이스를 끌어올리세요',
+        why: mult > 5
+          ? [`현 페이스 예상 마감액은 <b>${won(projected)}</b>로 목표 <b>${won(goal)}</b>의 <b>${rate.toFixed(0)}%</b>입니다.`,
+             `목표를 맞추려면 일평균 <b>${won(need)}</b>(현재의 ${mult.toFixed(0)}배)이 필요해 현실적이지 않습니다. 목표 달성보다 <b>손익분기를 지키면서 절대 펀딩액을 키우는 쪽</b>으로 기준을 두세요.`]
+          : [`현 페이스 예상 마감액 <b>${won(projected)}</b>는 목표의 <b>${rate.toFixed(0)}%</b>입니다.`,
+             `남은 ${remainDays}일 일평균 <b>${won(need)}</b>(현재의 ${mult.toFixed(1)}배)이면 목표에 닿습니다.`] });
+    }
+  }
+
+  actions.sort((a, b) => a.pri - b.pri);
+  return { signals, actions, all, recent, prev, N, be, elapsedPct, remainDays,
+           activeDays: active.length, issues, pivotCompare, budget, budgetLeft, dailyRoom,
+           cross, roasLow, roasHigh };
+}
+
+// ── 상황 요약 (배경 + 진행 경과) ─────────────────────────────
+function renderMainContext(a) {
+  const notes = CONFIG.mainContextNote || [];
+  const issues = (a && a.issues) || data.mainIssues || [];
+  if (!notes.length && !issues.length) return '';
+
+  const noteHtml = notes.length ? `
+    <div style="font-size:12.5px; line-height:1.8; color:var(--text-primary);">
+      ${notes.map(n => `<div style="display:flex; gap:8px; margin-bottom:6px;"><span style="color:var(--accent-primary); flex:none;">·</span><span>${n}</span></div>`).join('')}
+    </div>` : '';
+
+  const pivotDate = (a && a.pivotCompare) ? a.pivotCompare.date : null;
+  const timeline = issues.length ? `
+    <div style="margin-top:16px; padding-top:14px; border-top:0.5px solid var(--border-tertiary);">
+      <div style="font-size:11.5px; font-weight:600; color:var(--text-secondary); margin-bottom:10px;">진행 경과 <span style="font-weight:400; opacity:0.75;">· 시트 주요 이슈 자동 반영</span></div>
+      ${issues.map(it => {
+        const isPivot = it.date === pivotDate;
+        const idx = data.dates.indexOf(it.date);
+        return `<div style="display:flex; gap:11px; align-items:flex-start; padding:5px 0;">
+          <span style="flex:none; width:44px; font-size:11px; font-variant-numeric:tabular-nums; color:${isPivot ? 'var(--accent-primary-text)' : 'var(--text-secondary)'}; font-weight:${isPivot ? '700' : '500'};">${idx >= 0 ? fmt.dateMD(idx) : ''}</span>
+          <span style="flex:none; width:9px; display:flex; justify-content:center; padding-top:5px;">
+            <span style="width:${isPivot ? 8 : 6}px; height:${isPivot ? 8 : 6}px; border-radius:50%; background:${isPivot ? 'var(--accent-primary)' : 'var(--border-secondary)'};"></span>
+          </span>
+          <span style="font-size:12px; line-height:1.6; color:${isPivot ? 'var(--text-primary)' : 'var(--text-secondary)'}; font-weight:${isPivot ? '600' : '400'};">${it.text}</span>
+        </div>`;
+      }).join('')}
+    </div>` : '';
+
+  return `
+    <div style="background:var(--bg-secondary); border-radius:10px; padding:16px 18px; margin-bottom:20px;">
+      <div style="font-size:12px; font-weight:600; color:var(--text-secondary); margin-bottom:11px;">상황 요약</div>
+      ${noteHtml}
+      ${timeline}
+    </div>
+  `;
+}
+
+const INSIGHT_COLOR = {
+  good: { line: '#0F6E56', bg: 'rgba(15,110,86,0.08)',  fg: '#0F6E56', ic: 'ti-trending-up' },
+  warn: { line: '#EF9F27', bg: 'rgba(239,159,39,0.12)', fg: '#B26A00', ic: 'ti-alert-triangle' },
+  bad:  { line: '#D85A30', bg: 'rgba(216,90,48,0.10)',  fg: '#C0392B', ic: 'ti-alert-octagon' },
+  info: { line: '#185FA5', bg: 'rgba(24,95,165,0.08)',  fg: '#185FA5', ic: 'ti-info-circle' }
+};
+
+// ── 캠페인 소재별 분석 ───────────────────────────────────────
+//  전환수는 집계가 불확실하므로 노출·클릭 기반 지표(CTR·CPC·CPM)로만 판단한다.
+//  표본이 얇은 소재는 95% 신뢰구간이 겹치므로 '판단 유보'로 표시한다.
+function analyzeCreatives(liveKey) {
+  const list = (data.mainCreatives || [])
+    .filter(c => c.raw && c.raw.impressions > 0)
+    .filter(c => !liveKey || String(c.campaign).replace(/\s+/g, '') === liveKey);
+  if (list.length < 2) return null;
+
+  const T = list.reduce((a, c) => ({
+    spend: a.spend + (c.raw.spend || 0),
+    imp:   a.imp   + (c.raw.impressions || 0),
+    clk:   a.clk   + (c.raw.clicks || 0)
+  }), { spend: 0, imp: 0, clk: 0 });
+  const avgCtr = T.imp ? T.clk / T.imp * 100 : 0;
+
+  const stat = g => {
+    if (!g || !g.impressions) return null;
+    const ctr = g.clicks / g.impressions * 100;
+    return { spend: g.spend, imp: g.impressions, clk: g.clicks, ctr,
+             cpc: g.clicks ? g.spend / g.clicks : null,
+             cpm: g.impressions ? g.spend / g.impressions * 1000 : null };
+  };
+
+  // 일별 흐름 — 앞 절반 대비 뒤 절반 비교
+  const trendOf = daily => {
+    const act = (daily || []).filter(d => d.spend > 0 || d.imp > 0);
+    if (act.length < 2) return null;
+    const h = Math.floor(act.length / 2);
+    const late = act.slice(-h), early = act.slice(0, act.length - h);
+    const sum = arr => arr.reduce((a, d) => ({ spend: a.spend + d.spend, imp: a.imp + d.imp, clk: a.clk + d.clk }),
+                                  { spend: 0, imp: 0, clk: 0 });
+    const L = sum(late), E = sum(early);
+    const lCtr = L.imp ? L.clk / L.imp * 100 : null;
+    const eCtr = E.imp ? E.clk / E.imp * 100 : null;
+    const lSp = L.spend / late.length, eSp = E.spend / early.length;
+    return {
+      days: act.length, first: act[0].date, last: act[act.length - 1].date,
+      lateCtr: lCtr, earlyCtr: eCtr,
+      ctrPct: (eCtr && lCtr != null) ? (lCtr / eCtr - 1) * 100 : null,
+      lateSpend: lSp, earlySpend: eSp,
+      spendPct: eSp ? (lSp / eSp - 1) * 100 : null,
+      series: act
+    };
+  };
+
+  const items = list.map(c => {
+    const g = stat(c.raw);
+    const p = g.ctr / 100;
+    const se = Math.sqrt(Math.max(p * (1 - p), 1e-9) / g.imp) * 100 * 1.96;
+    const lo = Math.max(0, g.ctr - se), hi = g.ctr + se;
+    // 판정 — 전체 평균 CTR과 신뢰구간을 비교
+    let verdict = 'hold';
+    if (g.clk >= 30 && lo > avgCtr) verdict = 'good';
+    else if (g.clk >= 30 && hi < avgCtr) verdict = 'bad';
+    return { name: c.name, short: c.shortName || c.name, image: c.image,
+             ...g, lo, hi, verdict, share: T.spend ? g.spend / T.spend * 100 : 0,
+             nt: stat(c.nt), rt: stat(c.rt),
+             trNt: trendOf(c.dailyNt), trRt: trendOf(c.dailyRt),
+             trAll: trendOf((c.dailyNt || []).map((d, i) => {
+               const r = (c.dailyRt || [])[i] || { spend: 0, imp: 0, clk: 0 };
+               return { date: d.date, spend: d.spend + r.spend, imp: d.imp + r.imp, clk: d.clk + r.clk };
+             })) };
+  }).sort((a, b) => b.ctr - a.ctr);
+
+  // CPM 이상치 (중앙값의 1.3배 이상)
+  const cpms = items.map(x => x.cpm).filter(v => v != null).sort((a, b) => a - b);
+  const medCpm = cpms.length ? cpms[Math.floor(cpms.length / 2)] : null;
+  items.forEach(x => { x.cpmHigh = (medCpm && x.cpm != null) ? (x.cpm / medCpm >= 1.3) : false; });
+
+  // 해석
+  const notes = [];
+  const best = items[0], worst = items[items.length - 1];
+  if (best && worst && best !== worst && worst.ctr > 0) {
+    if (best.lo > worst.hi) {
+      notes.push({ level: 'good', text:
+        `<b>${best.name}</b>이 확실히 앞섭니다. CTR <b>${best.ctr.toFixed(2)}%</b>로 최저 <b>${worst.name}</b>(${worst.ctr.toFixed(2)}%)의 <b>${(best.ctr / worst.ctr).toFixed(1)}배</b>이고, 두 소재의 신뢰구간이 겹치지 않습니다. CPC도 ${best.cpc ? fmt.won(best.cpc) : '-'}로 가장 낮습니다.` });
+    } else {
+      notes.push({ level: 'info', text:
+        `CTR 1위는 <b>${best.name}</b>(${best.ctr.toFixed(2)}%)이지만 최저 소재와 신뢰구간이 겹칩니다. <b>순위 차이를 아직 확정할 수 없습니다.</b>` });
+    }
+  }
+  const holds = items.filter(x => x.verdict === 'hold');
+  if (holds.length) {
+    notes.push({ level: 'warn', text:
+      `<b>${holds.map(x => x.name).join(', ')}</b>은 클릭이 ${holds.map(x => fmt.num(x.clk)).join('·')}건뿐이라 신뢰구간이 넓습니다(${holds.map(x => x.lo.toFixed(2) + '~' + x.hi.toFixed(2) + '%').join(', ')}). <b>끄거나 늘리기 전에 노출을 더 쌓아야</b> 판단이 가능합니다.` });
+  }
+  // 흐름 — 소진이 늘고 CTR도 오르는 소재 / 소진이 줄고 CTR도 빠지는 소재
+  const rising = items.filter(x => x.trAll && x.trAll.spendPct > 20 && x.trAll.ctrPct > 5);
+  const fading = items.filter(x => x.trAll && x.trAll.spendPct < -30);
+  if (rising.length) {
+    notes.push({ level: 'good', text:
+      rising.map(x => `<b>${x.name}</b>은 일별 소진이 <b>${x.trAll.spendPct > 0 ? '+' : ''}${x.trAll.spendPct.toFixed(0)}%</b> 늘면서 CTR도 ${x.trAll.earlyCtr.toFixed(2)}% → <b>${x.trAll.lateCtr.toFixed(2)}%</b>로 올랐습니다.`).join(' ') +
+      ` 플랫폼이 예산을 몰아주는 방향과 실제 반응이 일치합니다.` });
+  }
+  if (fading.length) {
+    notes.push({ level: 'warn', text:
+      fading.map(x => {
+        const ctrTxt = (x.trAll.earlyCtr != null && x.trAll.lateCtr != null)
+          ? ` CTR도 ${x.trAll.earlyCtr.toFixed(2)}% → ${x.trAll.lateCtr.toFixed(2)}%로 ${x.trAll.ctrPct < 0 ? '빠졌' : '움직였'}습니다.` : '';
+        return `<b>${x.name}</b>은 일별 소진이 <b>${x.trAll.spendPct.toFixed(0)}%</b> 줄었습니다.${ctrTxt}`;
+      }).join(' ') + ` 플랫폼이 이미 예산을 빼고 있다는 뜻이라, 굳이 수동으로 끄지 않아도 자연히 정리됩니다.` });
+  }
+  // 세그먼트별 반등
+  const rebound = items.filter(x => x.trRt && x.trRt.ctrPct != null && x.trRt.ctrPct > 60 && x.rt && x.rt.clk < 30);
+  if (rebound.length) {
+    notes.push({ level: 'info', text:
+      rebound.map(x => `<b>${x.name}</b>은 리타겟 CTR이 최근 ${x.trRt.earlyCtr.toFixed(2)}% → <b>${x.trRt.lateCtr.toFixed(2)}%</b>로 튀었습니다.`).join(' ') +
+      ` 다만 클릭 표본이 작아 하루 반등일 수 있습니다. 며칠 더 지켜보세요.` });
+  }
+
+  const cpmOut = items.filter(x => x.cpmHigh);
+  if (cpmOut.length) {
+    notes.push({ level: 'warn', text:
+      `<b>${cpmOut.map(x => x.name).join(', ')}</b>은 CPM이 ${cpmOut.map(x => fmt.won(x.cpm)).join(', ')}로 중앙값 ${medCpm ? fmt.won(medCpm) : '-'}보다 높습니다. 노출을 사는 단가가 비싸다는 건 <b>플랫폼이 잘 밀어주지 않는다</b>는 신호입니다.` });
+  }
+  // 논타겟/리타겟 역전
+  const flip = items.filter(x => x.nt && x.rt && x.nt.ctr > 0 && x.rt.ctr > 0)
+                    .filter(x => x.rt.ctr / x.nt.ctr >= 1.5 && x.nt.imp > x.rt.imp);
+  if (flip.length) {
+    notes.push({ level: 'warn', text:
+      flip.map(x => `<b>${x.name}</b>은 리타겟 CTR ${x.rt.ctr.toFixed(2)}%가 논타겟 ${x.nt.ctr.toFixed(2)}%의 ${(x.rt.ctr / x.nt.ctr).toFixed(1)}배인데 노출은 논타겟이 ${(x.nt.imp / x.rt.imp).toFixed(1)}배 많습니다. <b>리타겟 쪽으로 옮기세요.</b>`).join(' ') });
+  }
+  const newAud = items.filter(x => x.nt && x.rt && x.rt.ctr > 0 && x.nt.ctr / x.rt.ctr >= 1.1 && x.clk >= 30);
+  if (newAud.length) {
+    notes.push({ level: 'good', text:
+      `<b>${newAud.map(x => x.name).join(', ')}</b>은 논타겟에서 더 잘 먹힙니다(논 ${newAud[0].nt.ctr.toFixed(2)}% vs 리 ${newAud[0].rt.ctr.toFixed(2)}%). <b>신규 유입용</b>으로 비중을 키우기 좋습니다.` });
+  }
+
+  return { items, total: T, avgCtr, notes, medCpm };
+}
+
+function renderCreativeAnalysis(liveName, liveKey) {
+  const a = analyzeCreatives(liveKey);
+  if (!a) return '';
+
+  const V = {
+    good: { t: '검증됨',    bg: 'rgba(15,110,86,0.14)',  fg: '#12876A', bar: '#12876A' },
+    bad:  { t: '부진',      bg: 'rgba(216,90,48,0.14)',  fg: '#D96A45', bar: '#D96A45' },
+    hold: { t: '판단 유보', bg: 'rgba(128,128,128,0.14)', fg: 'var(--text-secondary)', bar: '#9AA0A6' }
+  };
+  const maxCtr = Math.max.apply(null, a.items.map(x => x.hi));
+
+  const metric = (label, value, strong) => `
+    <div>
+      <div style="font-size:10.5px; color:var(--text-tertiary); margin-bottom:2px;">${label}</div>
+      <div style="font-size:12.5px; font-weight:${strong ? 600 : 500}; color:var(--text-primary); white-space:nowrap;">${value}</div>
+    </div>`;
+
+  const cards = a.items.map((x, i) => {
+    const v = V[x.verdict];
+    const w  = Math.max(2, x.ctr / maxCtr * 100);
+    const lo = x.lo / maxCtr * 100, hi = x.hi / maxCtr * 100;
+
+    // 논타겟 / 리타겟 반응
+    let seg = '';
+    if (x.nt && x.rt && x.nt.imp && x.rt.imp) {
+      const m = Math.max(x.nt.ctr, x.rt.ctr) || 1;
+      const row = (nm, g, win) => `
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span style="flex:none; width:38px; font-size:10.5px; color:var(--text-secondary);">${nm}</span>
+          <span style="flex:1; height:5px; background:var(--bg-secondary); border-radius:3px; overflow:hidden;">
+            <span style="display:block; width:${Math.max(2, g.ctr / m * 100).toFixed(0)}%; height:100%; background:${win ? v.bar : 'var(--border-secondary)'};"></span>
+          </span>
+          <span style="flex:none; width:42px; text-align:right; font-size:11px; font-weight:${win ? 700 : 500}; color:${win ? v.fg : 'var(--text-secondary)'};">${g.ctr.toFixed(2)}%</span>
+          <span style="flex:none; width:52px; text-align:right; font-size:10.5px; color:var(--text-tertiary);">${fmt.num(g.imp)}</span>
+        </div>`;
+      const ntWin = x.nt.ctr >= x.rt.ctr;
+      seg = `<div style="margin-top:11px; padding-top:10px; border-top:0.5px solid var(--border-tertiary); display:flex; flex-direction:column; gap:5px;">
+        ${row('논타겟', x.nt, ntWin)}
+        ${row('리타겟', x.rt, !ntWin)}
+      </div>`;
+    }
+
+    // 일별 흐름 — 소진 막대 + CTR 선
+    let flow = '';
+    if (x.trAll && x.trAll.series.length >= 2) {
+      const S = x.trAll.series;
+      const maxSp = Math.max.apply(null, S.map(d => d.spend)) || 1;
+      const ctrs = S.map(d => d.imp ? d.clk / d.imp * 100 : 0);
+      const maxCt = Math.max.apply(null, ctrs) || 1;
+      const W = 100, H = 26;
+      const bw = W / S.length;
+      const bars = S.map((d, k) => {
+        const h = Math.max(1, d.spend / maxSp * H);
+        return `<rect x="${(k * bw + bw * 0.18).toFixed(1)}" y="${(H - h).toFixed(1)}" width="${(bw * 0.64).toFixed(1)}" height="${h.toFixed(1)}" rx="1" fill="${v.bar}" opacity="0.30"/>`;
+      }).join('');
+      const pts = ctrs.map((c, k) => `${(k * bw + bw / 2).toFixed(1)},${(H - Math.max(1, c / maxCt * H)).toFixed(1)}`).join(' ');
+      const arrow = (p) => p == null ? '' : (p > 8 ? '<span style="color:#12876A;">▲</span>' : p < -8 ? '<span style="color:#D96A45;">▼</span>' : '<span style="color:var(--text-tertiary);">–</span>');
+      flow = `
+        <div style="margin-top:11px; padding-top:10px; border-top:0.5px solid var(--border-tertiary);
+          display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+          <span style="flex:none; font-size:10.5px; color:var(--text-tertiary);">${x.trAll.first.slice(5).replace('-', '/')}~${x.trAll.last.slice(5).replace('-', '/')}</span>
+          <svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="flex:none; overflow:visible;">
+            ${bars}
+            <polyline points="${pts}" fill="none" stroke="${v.bar}" stroke-width="1.6" stroke-linejoin="round"/>
+          </svg>
+          <span style="font-size:11px; color:var(--text-secondary); white-space:nowrap;">
+            소진 ${arrow(x.trAll.spendPct)} <b style="color:var(--text-primary);">${x.trAll.spendPct != null ? (x.trAll.spendPct > 0 ? '+' : '') + x.trAll.spendPct.toFixed(0) + '%' : '-'}</b>
+            <span style="color:var(--text-tertiary); margin:0 5px;">·</span>
+            CTR ${arrow(x.trAll.ctrPct)} <b style="color:var(--text-primary);">${x.trAll.earlyCtr != null ? x.trAll.earlyCtr.toFixed(2) : '-'}% → ${x.trAll.lateCtr != null ? x.trAll.lateCtr.toFixed(2) : '-'}%</b>
+          </span>
+        </div>`;
+    }
+
+    return `
+    <div style="display:flex; gap:14px; background:var(--bg-primary); border:1px solid var(--border-secondary);
+      border-left:3px solid ${v.bar}; border-radius:10px; padding:14px 16px; margin-bottom:10px;">
+
+      ${x.image ? `<img src="${x.image}" alt="" style="flex:none; width:76px; height:76px; object-fit:cover;
+        border-radius:8px; border:1px solid var(--border-tertiary);">` : ''}
+
+      <div style="flex:1; min-width:0;">
+        <div style="display:flex; align-items:center; gap:8px; margin-bottom:9px; flex-wrap:wrap;">
+          <span style="flex:none; width:19px; height:19px; border-radius:5px; background:var(--bg-secondary);
+            font-size:10.5px; font-weight:700; color:var(--text-secondary);
+            display:inline-flex; align-items:center; justify-content:center;">${i + 1}</span>
+          <span style="font-size:13.5px; font-weight:600; color:var(--text-primary);">${x.name}</span>
+          <span style="padding:2px 8px; border-radius:5px; background:${v.bg}; color:${v.fg};
+            font-size:10px; font-weight:700;">${v.t}</span>
+          <span style="margin-left:auto; font-size:17px; font-weight:700; color:${v.fg}; letter-spacing:-0.3px;">${x.ctr.toFixed(2)}%</span>
+        </div>
+
+        <!-- CTR 막대 + 95% 신뢰구간 -->
+        <div style="position:relative; height:8px; background:var(--bg-secondary); border-radius:4px; margin-bottom:5px;">
+          <span style="position:absolute; left:0; top:0; height:100%; width:${w.toFixed(1)}%;
+            background:${v.bar}; border-radius:4px; opacity:0.85;"></span>
+          <span style="position:absolute; left:${lo.toFixed(1)}%; width:${Math.max(1, hi - lo).toFixed(1)}%;
+            top:-2px; height:12px; border-left:1px solid var(--text-tertiary); border-right:1px solid var(--text-tertiary);
+            opacity:0.5;"></span>
+        </div>
+        <div style="font-size:10.5px; color:var(--text-tertiary); margin-bottom:11px;">
+          95% 신뢰구간 ${x.lo.toFixed(2)}~${x.hi.toFixed(2)}% · 전체 평균 ${a.avgCtr.toFixed(2)}%
+        </div>
+
+        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(74px, 1fr)); gap:10px 14px;">
+          ${metric('광고비', `${fmt.wonShort(x.spend)} <span style="color:var(--text-tertiary); font-weight:400;">${x.share.toFixed(0)}%</span>`)}
+          ${metric('노출', fmt.num(x.imp))}
+          ${metric('클릭', fmt.num(x.clk))}
+          ${metric('CPC', x.cpc ? fmt.wonShort(x.cpc) : '-', true)}
+          ${metric('CPM', `<span style="${x.cpmHigh ? 'color:#D96A45;' : ''}">${x.cpm ? fmt.wonShort(x.cpm) : '-'}</span>`)}
+        </div>
+
+        ${flow}
+        ${seg}
+      </div>
+    </div>`;
+  }).join('');
+
+  const noteHtml = a.notes.map(n => {
+    const c = INSIGHT_COLOR[n.level] || INSIGHT_COLOR.info;
+    return `<div style="display:flex; gap:9px; align-items:flex-start; padding:9px 0;
+      border-bottom:0.5px solid var(--border-tertiary);">
+      <i class="ti ${c.ic}" style="font-size:15px; color:${c.fg}; margin-top:2px; flex:none;"></i>
+      <span style="font-size:12.5px; line-height:1.7; color:var(--text-primary);">${n.text}</span></div>`;
+  }).join('');
+
+  return `
+    <div style="display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; margin:4px 0 12px;">
+      <span style="font-size:13px; font-weight:700; color:var(--text-primary);">${liveName ? liveName + ' ' : ''}소재별 성과</span>
+      <span style="font-size:11px; color:var(--text-secondary);">
+        전체 CTR ${a.avgCtr.toFixed(2)}% · 광고비 ${fmt.wonShort(a.total.spend)} · 노출 ${fmt.num(a.total.imp)} · 클릭 ${fmt.num(a.total.clk)}</span>
+      <span style="margin-left:auto; font-size:10.5px; color:var(--text-tertiary);">CTR 순 · 세로선은 95% 신뢰구간 · 흐름은 앞 절반 대비 뒤 절반</span>
+    </div>
+    ${cards}
+    ${noteHtml ? `
+      <div style="font-size:13px; font-weight:700; color:var(--text-primary); margin:20px 0 4px;">읽어낸 것</div>
+      <div>${noteHtml}</div>` : ''}
+  `;
+}
+
+function renderMainInsights() {
+  let a = null;
+  try { a = analyzeMain(); } catch (e) { console.warn('analyzeMain error', e); }
+  if (!a) return '';
+
+  // 판단에 쓰는 ROAS 카드
+  const roasCards = (a.cross && (a.cross.overallRoas != null || (a.cross.live && a.cross.live.incTarget != null))) ? `
+    <div style="margin-top:22px; padding-top:16px; border-top:0.5px solid var(--border-tertiary);">
+      <div style="font-size:13px; font-weight:700; color:var(--text-primary); margin-bottom:4px;">판단에 쓰는 ROAS</div>
+      <div style="font-size:11px; color:var(--text-secondary); margin-bottom:11px;">
+        손익분기 ${a.be ? a.be.roas.toFixed(0) + '%' : '-'}${a.cross.live ? ' · ' + a.cross.live.name + ' 기준' : ''} · 흐린 카드는 전환 집계 기반이라 참고용
+      </div>
+      <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(155px, 1fr)); gap:9px;">
+        ${[
+          a.cross.live ? { k: '증분 (공백일 대비)', v: a.cross.live.incTarget, d: '실제 펀딩 리프트', t: 1 } : null,
+          a.cross.live ? { k: '증분 (첫날 제외)',   v: a.cross.live.incRobust, d: '스파이크 제거', t: 1 } : null,
+          { k: '전체 기준', v: a.cross.overallRoas, d: '총 펀딩 ÷ 총 광고비', t: 1 },
+          a.cross.live ? { k: '플랫폼 (현 캠페인)', v: a.cross.live.platRoas, d: '전환 집계 기반', t: 0 } : null,
+          { k: '플랫폼 (누적)', v: a.cross.platRoas, d: '전환 집계 기반', t: 0 }
+        ].filter(x => x && x.v != null && isFinite(x.v)).map(x => {
+          const ok = a.be && x.v >= a.be.roas;
+          return `<div style="border:1px solid var(--border-secondary); border-radius:9px; padding:11px 13px; ${x.t ? '' : 'opacity:0.5;'}">
+            <div style="font-size:10.5px; color:var(--text-secondary);">${x.k}</div>
+            <div style="font-size:18px; font-weight:700; color:${ok ? '#12876A' : '#D96A45'}; margin:3px 0 2px; letter-spacing:-0.3px;">${x.v.toFixed(0)}%</div>
+            <div style="font-size:10px; color:var(--text-tertiary);">${x.d}</div>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>` : '';
+
+  return `
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title"><i class="ti ti-bulb" style="font-size:15px; color:#EF9F27;"></i>타겟광고 현황과 소재별 분석</span>
+        <span class="card-meta">시트 갱신 시 자동 재계산 · 집행 ${a.activeDays}일 기준</span>
+      </div>
+
+      ${renderMainContext(a)}
+
+      ${renderCreativeAnalysis(a.cross.live ? a.cross.live.name : null,
+          a.cross.live ? a.cross.live.name.replace(/\s+/g, '') : null)}
+
+      ${roasCards}
+
+      <div style="margin-top:14px; font-size:11px; color:var(--text-tertiary); line-height:1.6;">
+        시트의 광고비·노출·클릭·전환·전환매출과 매출 현황의 원가 구조로 자동 계산합니다.
+        손익분기 ROAS는 변동비(수수료·제조원가·배송비·LOSS·쿠폰)만 반영하며 판관비·사전 마케팅비 같은 고정비는 제외합니다.
+      </div>
+    </div>
+  `;
+}
+
 function renderMain() {
   const m = data.mainKpi || {cumulative:0, achievement:0, adSpend:0, adUsage:0, unitsSold:0};
   const t = data.mainTarget;
@@ -1654,6 +2523,8 @@ function renderMain() {
     </div>
 
     ${renderInternalAds('main')}
+
+    ${renderMainInsights()}
   `;
 }
 
